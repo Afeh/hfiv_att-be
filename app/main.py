@@ -3,7 +3,7 @@ from typing import Optional
 
 from fastapi import FastAPI, Depends, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import func
+from sqlalchemy import func, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -12,6 +12,27 @@ from .database import Base, engine, get_db
 from .settings import settings
 
 Base.metadata.create_all(bind=engine)
+
+# ── Migration: add is_absent column if missing (PostgreSQL & SQLite compatible) ─
+with engine.connect() as conn:
+    dialect = conn.dialect.name
+    try:
+        if dialect == "postgresql":
+            conn.execute(
+                text(
+                    "ALTER TABLE attendance ADD COLUMN IF NOT EXISTS is_absent "
+                    "BOOLEAN NOT NULL DEFAULT false"
+                )
+            )
+        else:
+            conn.execute(
+                text(
+                    "ALTER TABLE attendance ADD COLUMN is_absent BOOLEAN NOT NULL DEFAULT 0"
+                )
+            )
+        conn.commit()
+    except Exception:
+        pass  # column already exists
 
 app = FastAPI(title=settings.app_title)
 
@@ -46,6 +67,17 @@ def create_person(person: schemas.PersonCreate, db: Session = Depends(get_db)):
     return db_person
 
 
+@app.patch("/people/{person_id}", response_model=schemas.Person)
+def update_person(person_id: int, body: schemas.PersonUpdate, db: Session = Depends(get_db)):
+    db_person = db.get(models.Person, person_id)
+    if not db_person:
+        raise HTTPException(status_code=404, detail="Person not found")
+    db_person.name = body.name.strip()
+    db.commit()
+    db.refresh(db_person)
+    return db_person
+
+
 @app.get("/attendance", response_model=list[schemas.AttendanceRecord])
 def get_attendance(
     date: Optional[date_type] = Query(default=None),
@@ -68,7 +100,27 @@ def mark_attendance(record: schemas.AttendanceCreate, db: Session = Depends(get_
         raise HTTPException(status_code=404, detail="Person not found")
 
     attendance_date = record.attendance_date or date_type.today()
-    db_record = models.Attendance(person_id=record.person_id, date=attendance_date)
+
+    # Upsert: if a record already exists for this (person_id, date), update it
+    existing = (
+        db.query(models.Attendance)
+        .filter(
+            models.Attendance.person_id == record.person_id,
+            models.Attendance.date == attendance_date,
+        )
+        .first()
+    )
+    if existing:
+        existing.is_absent = record.is_absent
+        db.commit()
+        db.refresh(existing)
+        return existing
+
+    db_record = models.Attendance(
+        person_id=record.person_id,
+        date=attendance_date,
+        is_absent=record.is_absent,
+    )
     db.add(db_record)
     try:
         db.commit()
@@ -97,24 +149,31 @@ def get_people_stats(db: Session = Depends(get_db)):
 
     people = db.query(models.Person).order_by(models.Person.name).all()
 
-    # collect all attendance dates per person in one go
-    person_attendance: dict[int, set[date_type]] = {}
-    for pid, adate in db.query(models.Attendance.person_id, models.Attendance.date).all():
-        person_attendance.setdefault(pid, set()).add(adate)
+    # collect attendance records per person (date, is_absent)
+    person_records: dict[int, list[tuple[date_type, bool]]] = {}
+    for pid, adate, is_abs in db.query(
+        models.Attendance.person_id,
+        models.Attendance.date,
+        models.Attendance.is_absent,
+    ).all():
+        person_records.setdefault(pid, []).append((adate, is_abs))
 
     result = []
     for p in people:
         person_joined = p.created_at.date()
-        person_present_dates = person_attendance.get(p.id, set())
+        records = person_records.get(p.id, [])
+        present_dates = {d for d, a in records if not a}
+        absent_dates = {d for d, a in records if a}
 
         total_possible = sum(
             1 for d in distinct_dates
-            if d >= person_joined or d in person_present_dates
+            if d >= person_joined or d in present_dates or d in absent_dates
         )
-        present_count = sum(1 for d in distinct_dates if d in person_present_dates)
+        present_count = len(present_dates)
 
         result.append(
             schemas.PersonStats(
+                id=p.id,
                 name=p.name,
                 total_possible=total_possible,
                 total_attendance=present_count,
@@ -123,6 +182,18 @@ def get_people_stats(db: Session = Depends(get_db)):
         )
 
     return result
+
+
+@app.patch("/attendance/{attendance_id}/toggle", response_model=schemas.AttendanceRecord)
+def toggle_attendance(attendance_id: int, db: Session = Depends(get_db)):
+    """Toggle is_absent on an attendance record."""
+    record = db.get(models.Attendance, attendance_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Record not found")
+    record.is_absent = not record.is_absent
+    db.commit()
+    db.refresh(record)
+    return record
 
 
 @app.delete("/attendance/{attendance_id}", status_code=204)

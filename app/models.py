@@ -1,4 +1,5 @@
 from sqlalchemy import (
+    Boolean,
     Column,
     Integer,
     String,
@@ -32,6 +33,7 @@ class Attendance(Base):
     id = Column(Integer, primary_key=True, index=True)
     person_id = Column(Integer, ForeignKey("people.id"), nullable=False)
     date = Column(Date, nullable=False, index=True)
+    is_absent = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     person = relationship("Person", back_populates="attendance_records")
